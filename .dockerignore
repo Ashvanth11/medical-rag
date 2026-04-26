@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+**/__pycache__/
+**/*.pyc
+qdrant_data/
+data/raw_html/
+.DS_Store
+**/.DS_Store
+.vscode/
+*.docx
+*.pdf
+docs/
