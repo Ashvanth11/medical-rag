@@ -111,16 +111,28 @@ Benchmarked against 30 question/answer pairs spanning 12 medical topics. All que
 | Answer rate | **100%** | 30 / 30 answered — zero silent failures |
 | Retrieval recall | **93.3%** | 28 / 30 retrieved expected source URL |
 | Citation rate | **100%** | 30 / 30 answers contain `[N]` markers |
-| Keyword accuracy | **96.7%** | 29 / 30 contained expected answer keywords |
+| Keyword match rate | **96.7%** | 29 / 30 contained expected answer keywords |
 | Avg latency | **22.4 s** | Range: 9.8 s – 45.1 s (Ollama local, CPU) |
 
-The two retrieval misses (`diabetes_003`, `hbp_003`) both retrieved factually correct content from alternate pages — the expected URL was marked incorrectly in the test set, not a pipeline failure. A 93.3% retrieval recall with a 100% answer rate means the system never fails silently: it either answers correctly or explicitly says it can't.
+These historical metrics measure expected-source URL agreement, citation-marker
+presence, and keyword overlap. They do not establish answer correctness or whether
+the retrieved passages support each factual claim. An answer can pass all three
+checks and still contain unsupported claims.
+
+Claim-level faithfulness is evaluated separately with Claude Sonnet 5.5 against
+the exact context supplied to Llama. The October 31, 2026 run scored **89.9% mean
+per-answer faithfulness across 30 answers**, with 315 of 344 claims labeled
+supported and no remaining judge failures. Six pilot verdicts were reviewed by
+the user; original labels and known judge inconsistencies were retained. This
+is a judge-model estimate, not verified medical accuracy. See the
+[full results and caveats](docs/faithfulness-results.md) and
+[evaluation workflow](docs/faithfulness.md).
 
 To reproduce:
 
 ```bash
-python -m scripts.evaluate
-# outputs aggregate table + data/eval/results.json
+python -m scripts.evaluate --output data/eval/results.json
+# outputs aggregate table and full answer/context capture
 ```
 
 ---

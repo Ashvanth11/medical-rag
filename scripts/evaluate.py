@@ -10,7 +10,7 @@ Metrics per question:
     retrieval_hit   - at least one used_source URL matches an expected URL
     citation_present - answer contains at least one [N] citation
     keyword_hit     - answer contains at least one expected keyword (case-insensitive)
-    answered        - answer is not the DONT_KNOW fallback
+    answered        - pipeline trace identifies an answer rather than a fallback
 
 Aggregate metrics:
     retrieval_recall  = mean(retrieval_hit)
@@ -20,16 +20,19 @@ Aggregate metrics:
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Ensure project root is on the path when run as a module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.rag.pipeline import DONT_KNOW, answer_question
+from src.rag.pipeline import answer_question
+from src.rag.generate import MODEL
 
 CITATION_RE = re.compile(r"\[\d+\]")
 
@@ -45,10 +48,11 @@ def evaluate_one(pair: dict, top_k: int) -> dict:
     expected_keywords = [kw.lower() for kw in pair.get("expected_answer_keywords", [])]
 
     t0 = time.time()
-    answer, used_sources, _ = answer_question(question, top_k=top_k)
+    trace = {}
+    answer, used_sources, _ = answer_question(question, top_k=top_k, trace=trace)
     latency = round(time.time() - t0, 2)
 
-    answered = DONT_KNOW not in answer
+    answered = trace["status"] == "answered"
     citation_present = bool(CITATION_RE.search(answer))
 
     used_urls = {s.get("url", "") for s in used_sources}
@@ -61,6 +65,8 @@ def evaluate_one(pair: dict, top_k: int) -> dict:
         "id": pair.get("id", ""),
         "topic": pair.get("topic", ""),
         "question": question,
+        "answer": answer,
+        "trace": trace,
         "answered": answered,
         "retrieval_hit": retrieval_hit,
         "citation_present": citation_present,
@@ -116,10 +122,10 @@ def print_aggregate(results: list[dict]) -> dict:
 
     print("\nAggregate Results")
     print(f"  Questions evaluated : {agg['n']}")
-    print(f"  Answer rate         : {agg['answer_rate']}%  (pipeline returned an answer, not DONT_KNOW)")
+    print(f"  Answer rate         : {agg['answer_rate']}%  (pipeline returned an answer rather than a fallback)")
     print(f"  Retrieval recall    : {agg['retrieval_recall']}%  (correct source in used_sources)")
     print(f"  Citation rate       : {agg['citation_rate']}%  (answer contains [N] citation)")
-    print(f"  Keyword accuracy    : {agg['keyword_accuracy']}%  (answer contains expected keyword)")
+    print(f"  Keyword match rate  : {agg['keyword_accuracy']}%  (answer contains expected keyword)")
     print(f"  Avg latency         : {agg['avg_latency_s']}s")
     return agg
 
@@ -147,9 +153,16 @@ def main():
         default=None,
         help="Only evaluate questions for a specific topic (e.g. diabetes)",
     )
+    parser.add_argument("--ids", nargs="+", help="Evaluate only these question IDs")
+    parser.add_argument("--seed-capture", help="Reuse matching full answers from a previous capture")
     args = parser.parse_args()
 
     qa_pairs = load_qa_pairs(args.qa_pairs)
+    if args.ids:
+        available = {p["id"] for p in qa_pairs}
+        if set(args.ids) - available:
+            parser.error("Unknown question IDs")
+        qa_pairs = [p for p in qa_pairs if p["id"] in args.ids]
     if args.topic:
         qa_pairs = [p for p in qa_pairs if p.get("topic") == args.topic]
         if not qa_pairs:
@@ -159,10 +172,53 @@ def main():
     print(f"Evaluating {len(qa_pairs)} questions (top_k={args.top_k})...\n")
 
     results = []
+    metadata = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "generator_model": MODEL, "temperature": 0, "top_k": args.top_k,
+        "qa_pairs": args.qa_pairs,
+    }
+    reused = {}
+    if args.seed_capture:
+        seed_bytes = Path(args.seed_capture).read_bytes()
+        seed = json.loads(seed_bytes)
+        for field in ("generator_model", "temperature", "top_k", "qa_pairs"):
+            if seed.get("metadata", {}).get(field) != metadata[field]:
+                parser.error(f"Seed capture differs in {field}")
+        pairs_by_id = {p["id"]: p for p in qa_pairs}
+        for row in seed["results"]:
+            if row["id"] not in pairs_by_id:
+                continue
+            pair = pairs_by_id[row["id"]]
+            if row["question"] != pair["question"] or "answer" not in row or "trace" not in row:
+                parser.error("Seed answer does not match the current question or lacks trace data")
+            if row["expected_urls"] != sorted(set(pair.get("expected_source_urls", []))):
+                parser.error("Seed expected URLs differ")
+            expected_keywords = [kw.lower() for kw in pair.get("expected_answer_keywords", [])]
+            row["keyword_hit"] = any(kw in row["answer"].lower() for kw in expected_keywords)
+            reused[row["id"]] = row
+        metadata["seed_capture_sha256"] = hashlib.sha256(seed_bytes).hexdigest()
+        metadata["seed_capture_metadata"] = seed["metadata"]
+        metadata["reused_ids"] = list(reused)
+
+    def save(aggregate):
+        if args.output:
+            out_path = Path(args.output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = out_path.with_suffix(out_path.suffix + ".tmp")
+            temporary.write_text(json.dumps({
+                "metadata": metadata, "aggregate": aggregate, "results": results,
+            }, indent=2))
+            temporary.replace(out_path)
+
     for i, pair in enumerate(qa_pairs, 1):
         print(f"  [{i}/{len(qa_pairs)}] {pair['question'][:70]}...", end=" ", flush=True)
-        result = evaluate_one(pair, top_k=args.top_k)
+        result = reused.get(pair["id"])
+        if result is None:
+            result = evaluate_one(pair, top_k=args.top_k)
+        else:
+            print("[reused]", end=" ")
         results.append(result)
+        save({})
         flags = "".join([
             "A" if result["answered"] else ".",
             "R" if result["retrieval_hit"] else ".",
@@ -176,10 +232,7 @@ def main():
     agg = print_aggregate(results)
 
     if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w") as f:
-            json.dump({"aggregate": agg, "results": results}, f, indent=2)
+        save(agg)
         print(f"\nFull results written to {args.output}")
 
     # Exit with non-zero if retrieval recall is below 50%

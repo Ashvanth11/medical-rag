@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 
 from src.rag.prompting import SYSTEM_PROMPT, build_user_prompt
 from src.rag.generate import generate_answer
@@ -29,7 +30,12 @@ def answer_question(
     question: str,
     top_k: int = 5,
     history: list[dict] | None = None,
+    *,
+    trace: dict | None = None,
 ) -> tuple[str, list[dict], list[dict]]:
+    if trace is not None:
+        trace.clear()
+        trace.update(status="abstained", context_chunks=[], retrieval_scores=[])
     trimmed = (history or [])[-(MAX_HISTORY_TURNS * 2):]
 
     chunks, scores = retrieve_top_k(question, top_k=top_k)
@@ -58,6 +64,11 @@ def answer_question(
         return fallback, [], trimmed + new_turn
 
     user_prompt = build_user_prompt(question, chunks)
+    if trace is not None:
+        trace.update(
+            context_chunks=deepcopy(chunks), retrieval_scores=list(scores),
+            system_prompt=SYSTEM_PROMPT, user_prompt=user_prompt,
+        )
     answer = generate_answer(SYSTEM_PROMPT, user_prompt, trimmed)
 
     # Hard fallback logic
@@ -76,5 +87,10 @@ def answer_question(
 
     new_turn[1]["content"] = answer
     updated_history = trimmed + new_turn
+
+    if trace is not None:
+        trace["status"] = "abstained" if answer in (
+            DONT_KNOW, OUT_OF_SCOPE_OFFTOPIC, OUT_OF_SCOPE_MEDICAL
+        ) else "answered"
 
     return answer, used_sources, updated_history
